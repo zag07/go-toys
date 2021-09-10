@@ -1,4 +1,4 @@
-module github.com/zs368/go-toys/web
+module go-toys/web
 
 go 1.16
 

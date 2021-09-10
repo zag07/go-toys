@@ -1,3 +1,3 @@
-module github.com/zs368/go-demo/toys/web-gee/gee
+module go-toys/web/gee
 
 go 1.16
