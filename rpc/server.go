@@ -2,11 +2,12 @@ package rpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"go-toys/rpc/codec"
@@ -25,7 +26,9 @@ var DefaultOption = &Option{
 }
 
 // Server represents an RPC Server
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 // NewServer returns a new Server.
 func NewServer() *Server {
@@ -35,16 +38,37 @@ func NewServer() *Server {
 // DefaultServer is the default instance of *Server.
 var DefaultServer = NewServer()
 
+// Register publishes in the server the set of methods of the
+// receiver value that satisfy the following conditions:
+//	- exported method of exported type
+//	- two arguments, both of exported type
+//	- the second argument is a pointer
+//	- one return value, of type error
+// It returns an error if the receiver is not an exported type or has
+// no suitable methods. It also logs the error using package log.
+// The client accesses each method using a string of the form "Type.Method",
+// where Type is the receiver's concrete type.
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register publishes the receiver's methods in the DefaultServer.
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection.
-func (s *Server) Accept(lis net.Listener) {
+func (server *Server) Accept(lis net.Listener) {
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
 			log.Println("rpc server: accept error:", err)
 			return
 		}
-		go s.ServeConn(conn)
+		go server.ServeConn(conn)
 	}
 }
 
@@ -57,7 +81,7 @@ func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
 
 // ServeConn runs the server on a single connection.
 // ServeConn blocks, serving the connection until the client hangs up.
-func (s *Server) ServeConn(conn io.ReadWriteCloser) {
+func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() { _ = conn.Close() }()
 	var opt Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
@@ -73,27 +97,27 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
-	s.serveCodec(f(conn))
+	server.serveCodec(f(conn))
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
-func (s *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
-		req, err := s.readRequest(cc)
+		req, err := server.readRequest(cc)
 		if err != nil {
 			if req == nil {
 				break
 			}
 			req.h.Error = err.Error()
-			s.sendResponse(cc, req.h, invalidRequest, sending)
+			server.sendResponse(cc, req.h, invalidRequest, sending)
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -102,22 +126,37 @@ func (s *Server) serveCodec(cc codec.Codec) {
 type request struct {
 	h            *codec.Header
 	argv, replyv reflect.Value
+	mtype        *methodType
+	svc          *service
 }
 
-func (s *Server) readRequest(cc codec.Codec) (*request, error) {
-	h, err := s.readRequestHeader(cc)
+func (server *Server) readRequest(codec codec.Codec) (*request, error) {
+	h, err := server.readRequestHeader(codec)
 	if err != nil {
 		return nil, err
 	}
+
 	req := &request{h: h}
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, nil
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	// make sure that argvi is a pointer, ReadBody need a pointer as parameter
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = codec.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err:", err)
+		return req, err
 	}
 	return req, nil
 }
 
-func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
+func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -128,7 +167,7 @@ func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
-func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
+func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
 	if err := cc.Write(h, body); err != nil {
@@ -136,9 +175,36 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(codec codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("rpc resp %d", req.h.Seq))
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(codec, req.h, invalidRequest, sending)
+		return
+	}
+	server.sendResponse(codec, req.h, req.replyv.Interface(), sending)
+}
+
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName := serviceMethod[:dot]
+	methodName := serviceMethod[dot+1:]
+
+	// Look up the request.
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc: can't find service " + serviceMethod)
+		return
+	}
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc: can't find method " + serviceMethod)
+	}
+	return
 }
