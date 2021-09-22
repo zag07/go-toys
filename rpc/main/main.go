@@ -1,12 +1,13 @@
 package main
 
 import (
+	"context"
+	"go-toys/rpc"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
-
-	"go-toys/rpc"
 )
 
 type Foo int
@@ -23,22 +24,19 @@ func startServer(addr chan string) {
 	if err := rpc.Register(&foo); err != nil {
 		log.Fatal("register error:", err)
 	}
-	// pick a free port
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		log.Fatal("network error:", err)
 	}
 	log.Println("start rpc server on", l.Addr())
+
+	rpc.HandleHTTP()
 	addr <- l.Addr().String()
-	rpc.Accept(l)
+	http.Serve(l, nil)
 }
 
-func main() {
-	log.SetFlags(0)
-	addr := make(chan string)
-	go startServer(addr)
-
-	client, _ := rpc.Dial("tcp", <-addr)
+func call(addr chan string) {
+	client, _ := rpc.DialHTTP("tcp", <-addr)
 	defer func() { _ = client.Close() }()
 
 	time.Sleep(time.Second)
@@ -50,11 +48,18 @@ func main() {
 			defer wg.Done()
 			args := &Args{Num1: i, Num2: i * i}
 			var reply int
-			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error:", err)
 			}
 			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
 		}(i)
 	}
 	wg.Wait()
+}
+
+func main() {
+	log.SetFlags(0)
+	addr := make(chan string)
+	go call(addr)
+	startServer(addr)
 }
