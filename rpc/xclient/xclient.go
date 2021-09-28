@@ -2,9 +2,11 @@ package xclient
 
 import (
 	"context"
-	"go-toys/rpc"
+	"io"
 	"reflect"
 	"sync"
+
+	"go-toys/rpc"
 )
 
 type XClient struct {
@@ -15,7 +17,7 @@ type XClient struct {
 	clients map[string]*rpc.Client
 }
 
-// var _ io.Closer = (*XClient)(nil)
+var _ io.Closer = (*XClient)(nil)
 
 func NewXClient(d Discovery, mode SelectMode, opt *rpc.Option) *XClient {
 	return &XClient{
