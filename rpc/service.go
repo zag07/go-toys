@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"log"
 	"reflect"
+	"sync"
 	"sync/atomic"
 )
 
@@ -18,32 +19,11 @@ func (m *methodType) NumCalls() (n uint64) {
 	return atomic.LoadUint64(&m.numCalls)
 }
 
-func (m *methodType) newArgv() reflect.Value {
-	var argv reflect.Value
-	if m.ArgType.Kind() == reflect.Ptr {
-		argv = reflect.New(m.ArgType.Elem())
-	} else {
-		argv = reflect.New(m.ArgType).Elem()
-	}
-	return argv
-}
-
-func (m *methodType) newReplyv() reflect.Value {
-	replyv := reflect.New(m.ReplyType.Elem())
-	switch m.ReplyType.Elem().Kind() {
-	case reflect.Map:
-		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
-	case reflect.Slice:
-		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
-	}
-	return replyv
-}
-
 type service struct {
-	name   string
-	rcvr   reflect.Value
-	typ    reflect.Type
-	method map[string]*methodType
+	name   string                 // name of service
+	rcvr   reflect.Value          // receiver of methods for the service
+	typ    reflect.Type           // type of the receiver
+	method map[string]*methodType // registered methods
 }
 
 func newService(rcvr interface{}) *service {
@@ -86,14 +66,19 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 	return ast.IsExported(t.Name()) || t.PkgPath() == ""
 }
 
-func (s *service) call(mtype *methodType, argv, replyv reflect.Value) error {
+func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
+	if wg != nil {
+		defer wg.Done()
+	}
 	atomic.AddUint64(&mtype.numCalls, 1)
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
 	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
 	// The return value for the method is an error.
-	if errInter := returnValues[0].Interface(); errInter != nil {
-		return errInter.(error)
+	errInter, errmsg := returnValues[0].Interface(), ""
+	if errInter != nil {
+		errmsg = errInter.(error).Error()
 	}
-	return nil
+	server.sendResponse(sending, req, replyv.Interface(), codec, errmsg)
+	server.freeRequest(req)
 }

@@ -13,20 +13,18 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"go-toys/rpc/codec"
 )
 
 var ErrShutdown = errors.New("connection is shut down")
 
 // Call represents an active RPC.
 type Call struct {
-	Seq           uint64
-	ServiceMethod string
-	Args          interface{}
-	Reply         interface{}
-	Error         error
-	Done          chan *Call
+	Seq           uint64      // ???
+	ServiceMethod string      // The name of the service and method to call.
+	Args          interface{} // The argument to the function (*struct).
+	Reply         interface{} // The reply from the function (*struct).
+	Error         error       // After completion, the error status.
+	Done          chan *Call  // Receives *Call when Go is complete.
 }
 
 // Client represents an RPC Client.
@@ -34,20 +32,22 @@ type Call struct {
 // with a single Client, and a Client may be used by
 // multiple goroutines simultaneously.
 type Client struct {
-	codec codec.Codec
-	opt   *Option
+	codec ClientCodec
+	opt   *Option // 拓展字段
 
-	sending sync.Mutex
-	header  codec.Header
+	reqMutex sync.Mutex // protects following
+	request  Request
 
-	mutex    sync.Mutex
+	mutex    sync.Mutex // protects following
 	seq      uint64
 	pending  map[uint64]*Call
-	closing  bool
-	shutdown bool
+	closing  bool // user has called Close
+	shutdown bool // server has told us to stop
 }
 
 var _ io.Closer = (*Client)(nil)
+
+
 
 type clientResult struct {
 	client *Client
@@ -56,101 +56,8 @@ type clientResult struct {
 
 type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
-func (call *Call) done() {
-	call.Done <- call
-}
-
-// IsAvailable return true if the client does work
-func (client *Client) IsAvailable() bool {
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-	return !client.shutdown && !client.closing
-}
-
-func (client *Client) registerCall(call *Call) (uint64, error) {
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-	if client.closing || client.shutdown {
-		return 0, ErrShutdown
-	}
-	call.Seq = client.seq
-	client.seq++
-	client.pending[call.Seq] = call
-	return call.Seq, nil
-}
-
-func (client *Client) removeCall(seq uint64) *Call {
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-	call := client.pending[seq]
-	delete(client.pending, seq)
-	return call
-}
-
-func (client *Client) terminateCalls(err error) {
-	client.sending.Lock()
-	defer client.sending.Unlock()
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-	client.shutdown = true
-	for _, call := range client.pending {
-		call.Error = err
-		call.done()
-	}
-}
-
-func (client *Client) receive() {
-	var err error
-	for err == nil {
-		var h codec.Header
-		if err = client.codec.ReadHeader(&h); err != nil {
-			break
-		}
-		call := client.removeCall(h.Seq)
-		switch {
-		case call == nil:
-			err = client.codec.ReadBody(nil)
-		case h.Error != "":
-			call.Error = fmt.Errorf(h.Error)
-			err = client.codec.ReadBody(nil)
-			call.done()
-		default:
-			err = client.codec.ReadBody(call.Reply)
-			if err != nil {
-				call.Error = errors.New("reading body " + err.Error())
-			}
-			call.done()
-		}
-	}
-	client.terminateCalls(err)
-}
-
-func (client *Client) send(call *Call) {
-	client.sending.Lock()
-	defer client.sending.Unlock()
-
-	seq, err := client.registerCall(call)
-	if err != nil {
-		call.Error = err
-		call.done()
-		return
-	}
-
-	client.header.ServiceMethod = call.ServiceMethod
-	client.header.Seq = seq
-	client.header.Error = ""
-
-	if err := client.codec.Write(&client.header, call.Args); err != nil {
-		call := client.removeCall(seq)
-		if call != nil {
-			call.Error = err
-			call.done()
-		}
-	}
-}
-
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
-	f := codec.NewCodecFuncMap[opt.CodecType]
+	f := NewClientCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
 		log.Println("rpc client: codec error:", err)
@@ -164,30 +71,120 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(codec codec.Codec, opt *Option) *Client {
+func newClientCodec(codec ClientCodec, opt *Option) *Client {
 	client := &Client{
 		codec:   codec,
 		opt:     opt,
-		seq:     1,
 		pending: make(map[uint64]*Call),
 	}
-	go client.receive()
+	go client.input()
 	return client
 }
 
-func parseOptions(opts ...*Option) (*Option, error) {
-	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
+func (call *Call) done() {
+	call.Done <- call
+}
+
+// IsAvailable return true if the client does work
+func (client *Client) IsAvailable() bool {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	return !client.shutdown && !client.closing
+}
+
+func (client *Client) send(call *Call) {
+	client.reqMutex.Lock()
+	defer client.reqMutex.Unlock()
+
+	// Register this call.
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	if client.shutdown || client.closing {
+		call.Error = ErrShutdown
+		call.done()
+		return
 	}
-	if len(opts) != 1 {
-		return nil, errors.New("number of options is more than 1")
+	call.Seq = client.seq
+	client.seq++
+	client.pending[call.Seq] = call
+
+	// Encode and send the request.
+	client.request.Seq = call.Seq
+	client.request.ServiceMethod = call.ServiceMethod
+	err := client.codec.WriteRequest(&client.request, call.Args)
+	if err != nil {
+		client.mutex.Lock()
+		defer client.mutex.Unlock()
+		call = client.pending[call.Seq]
+		delete(client.pending, call.Seq)
+		if call != nil {
+			call.Error = err
+			call.done()
+		}
 	}
-	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
-	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
+}
+
+func (client *Client) input() {
+	var err error
+	var response Response
+	for err == nil {
+		response = Response{}
+		if err = client.codec.ReadResponseHeader(&response); err != nil {
+			break
+		}
+		seq := response.Seq
+		client.mutex.Lock()
+		call := client.pending[seq]
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+
+		switch {
+		case call == nil:
+			err = client.codec.ReadResponseBody(nil)
+			if err != nil {
+				err = errors.New("reading error body: " + err.Error())
+			}
+		case response.Error != "":
+			call.Error = fmt.Errorf(response.Error)
+			err = client.codec.ReadResponseBody(nil)
+			if err != nil {
+				err = errors.New("reading error body: " + err.Error())
+			}
+			call.done()
+		default:
+			err = client.codec.ReadResponseBody(call.Reply)
+			if err != nil {
+				call.Error = errors.New("reading body " + err.Error())
+			}
+			call.done()
+		}
 	}
-	return opt, nil
+	// Terminate pending calls.
+	client.reqMutex.Lock()
+	client.mutex.Lock()
+	client.shutdown = true
+	closing := client.closing
+	if err == io.EOF {
+		if closing {
+			err = ErrShutdown
+		} else {
+			err = io.ErrUnexpectedEOF
+		}
+	}
+	for _, call := range client.pending {
+		call.Error = err
+		call.done()
+	}
+	client.mutex.Unlock()
+	client.reqMutex.Unlock()
+	if err != io.EOF && !closing {
+		log.Println("rpc: client protocol error:", err)
+	}
+}
+
+// Dial connects to an RPC server at the specified network address.
+func Dial(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Client, error) {
@@ -221,9 +218,19 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Cl
 	}
 }
 
-// Dial connects to an RPC server at the specified network address.
-func Dial(network, address string, opts ...*Option) (*Client, error) {
-	return dialTimeout(NewClient, network, address, opts...)
+func parseOptions(opts ...*Option) (*Option, error) {
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
 }
 
 // Close calls the underlying codec's Close method. If the connection is already
@@ -260,9 +267,11 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
 	select {
 	case <-ctx.Done():
-		client.removeCall(call.Seq)
+		client.mutex.Lock()
+		client.mutex.Unlock()
+		delete(client.pending, call.Seq)
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
-	case call := <-call.Done:
+	case call = <-call.Done:
 		return call.Error
 	}
 }
