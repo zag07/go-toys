@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	serverAddr     string
-	httpServerAddr string
-	once, httpOnce sync.Once
+	serverAddr, newServerAddr string
+	httpServerAddr            string
+	once, newOnce, httpOnce   sync.Once
 )
 
 type Args struct {
@@ -50,6 +50,12 @@ func startServer() {
 	// httpOnce.Do(startHttpServer)
 }
 
+func startNewServer() {
+	newServer := NewServer()
+	newServer.Register(new(Arith))
+	newServer.Register()
+}
+
 func startHttpServer() {
 	server := httptest.NewServer(nil)
 	httpServerAddr = server.Listener.Addr().String()
@@ -59,6 +65,9 @@ func startHttpServer() {
 func TestRPC(t *testing.T) {
 	once.Do(startServer)
 	testRPC(t, serverAddr)
+	newOnce.Do(startNewServer)
+	testRPC(t, newServerAddr)
+	testNewServerRPC(t, newServerAddr)
 }
 
 func testRPC(t *testing.T, addr string) {

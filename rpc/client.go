@@ -27,6 +27,16 @@ type Call struct {
 	Done          chan *Call  // Receives *Call when Go is complete.
 }
 
+func (call *Call) done() {
+	select {
+	case call.Done <- call:
+	default:
+		if debugLog {
+			log.Println("rpc: discarding Call reply due to insufficient Done chan capacity")
+		}
+	}
+}
+
 // Client represents an RPC Client.
 // There may be multiple outstanding Calls associated
 // with a single Client, and a Client may be used by
@@ -45,15 +55,6 @@ type Client struct {
 	shutdown bool // server has told us to stop
 }
 
-var _ io.Closer = (*Client)(nil)
-
-
-
-type clientResult struct {
-	client *Client
-	err    error
-}
-
 type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
@@ -68,10 +69,10 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	return newClientCodec(f(conn), opt), nil
+	return NewClientWithCodec(f(conn), opt), nil
 }
 
-func newClientCodec(codec ClientCodec, opt *Option) *Client {
+func NewClientWithCodec(codec ClientCodec, opt *Option) *Client {
 	client := &Client{
 		codec:   codec,
 		opt:     opt,
@@ -81,11 +82,6 @@ func newClientCodec(codec ClientCodec, opt *Option) *Client {
 	return client
 }
 
-func (call *Call) done() {
-	call.Done <- call
-}
-
-// IsAvailable return true if the client does work
 func (client *Client) IsAvailable() bool {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
@@ -182,57 +178,6 @@ func (client *Client) input() {
 	}
 }
 
-// Dial connects to an RPC server at the specified network address.
-func Dial(network, address string, opts ...*Option) (*Client, error) {
-	return dialTimeout(NewClient, network, address, opts...)
-}
-
-func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Client, error) {
-	opt, err := parseOptions(opts...)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			_ = conn.Close()
-		}
-	}()
-	ch := make(chan clientResult)
-	go func() {
-		client, err := f(conn, opt)
-		ch <- clientResult{client: client, err: err}
-	}()
-	if opt.ConnectTimeout == 0 {
-		result := <-ch
-		return result.client, result.err
-	}
-	select {
-	case <-time.After(opt.ConnectTimeout):
-		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
-	case result := <-ch:
-		return result.client, result.err
-	}
-}
-
-func parseOptions(opts ...*Option) (*Option, error) {
-	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
-	}
-	if len(opts) != 1 {
-		return nil, errors.New("number of options is more than 1")
-	}
-	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
-	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
-	}
-	return opt, nil
-}
-
 // Close calls the underlying codec's Close method. If the connection is already
 // shutting down, ErrShutdown is returned.
 func (client *Client) Close() error {
@@ -268,11 +213,62 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	select {
 	case <-ctx.Done():
 		client.mutex.Lock()
-		client.mutex.Unlock()
+		defer client.mutex.Unlock()
 		delete(client.pending, call.Seq)
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
 	case call = <-call.Done:
 		return call.Error
+	}
+}
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+func parseOptions(opts ...*Option) (*Option, error) {
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
+}
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Client, error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
 	}
 }
 
@@ -296,6 +292,11 @@ func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 		Addr: nil,
 		Err:  err,
 	}
+}
+
+// Dial connects to an RPC server at the specified network address.
+func Dial(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 // DialHTTP connects to an HTTP RPC server at the specified network address

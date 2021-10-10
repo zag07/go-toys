@@ -8,17 +8,17 @@ import (
 
 const debugText = `<html>
 	<body>
-	<title>RPC Services</title>
+	<title>Services</title>
 	{{range .}}
 	<hr>
 	Service {{.Name}}
 	<hr>
 		<table>
 		<th align=center>Method</th><th align=center>Calls</th>
-		{{range $name, $mtype := .Method}}
+		{{range .Method}}
 			<tr>
-			<td align=left font=fixed>{{$name}}({{$mtype.ArgType}}, {{$mtype.ReplyType}}) error</td>
-			<td align=center>{{$mtype.NumCalls}}</td>
+			<td align=left font=fixed>{{.Name}}({{.Type.ArgType}}, {{.Type.ReplyType}}) error</td>
+			<td align=center>{{.Type.NumCalls}}</td>
 			</tr>
 		{{end}}
 		</table>
@@ -27,6 +27,9 @@ const debugText = `<html>
 	</html>`
 
 var debug = template.Must(template.New("RPC debug").Parse(debugText))
+
+// If set, print log statements for internal and I/O errors.
+var debugLog = true
 
 type debugHTTP struct {
 	*Server
