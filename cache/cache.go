@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"go-toys/cache/singleflight"
 	"log"
 	"sync"
 
@@ -36,6 +37,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		name:       name,
 		getter:     getter,
 		cacheBytes: cacheBytes,
+		loadGroup:  &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
@@ -63,6 +65,11 @@ type Group struct {
 	// contains keys which consistent hash on to this process's
 	// peer number.
 	mainCache cache
+
+	// loadGroup ensures that each key is only fetched once
+	// (either locally or remotely), regardless of the number of
+	// concurrent callers.
+	loadGroup *singleflight.Group
 }
 
 // RegisterPeers registers a PeerPicker for choosing remote peer
@@ -85,15 +92,23 @@ func (g *Group) Get(key string) (ByteView, error) {
 }
 
 func (g *Group) load(key string) (value ByteView, err error) {
-	if g.peers != nil {
-		if peer, ok := g.peers.PickPeer(key); ok {
-			if value, err = g.getFromPeer(peer, key); err == nil {
-				return value, nil
+	viewi, err := g.loadGroup.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[Cache] Failed to get from peer", err)
 			}
-			log.Println("[GeeCache] Failed to get from peer", err)
 		}
+		return g.getLocally(key)
+	})
+
+	if err != nil {
+		return ByteView{}, err
 	}
-	return g.getLocally(key)
+
+	return viewi.(ByteView), nil
 }
 
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
