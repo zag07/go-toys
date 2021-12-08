@@ -24,3 +24,12 @@ func TestSession_Find(t *testing.T) {
 		t.Fatal("failed find all records")
 	}
 }
+
+func TestSession_First(t *testing.T) {
+	var user User
+	s := NewSession().Model(&User{})
+	err := s.First(&user)
+	if err != nil || user.Name != "Tom" {
+		t.Fatal("failed find first record")
+	}
+}
