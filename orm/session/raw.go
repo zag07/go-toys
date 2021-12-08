@@ -2,18 +2,25 @@ package session
 
 import (
 	"database/sql"
+	"go-toys/orm/dialect"
 	"go-toys/orm/log"
+	"go-toys/orm/schema"
 	"strings"
 )
 
-func New(db *sql.DB) *Session {
-	return &Session{db: db}
+func New(db *sql.DB, dialect dialect.Dialect) *Session {
+	return &Session{
+		db:      db,
+		dialect: dialect,
+	}
 }
 
 type Session struct {
-	db      *sql.DB
-	sql     strings.Builder
-	sqlVars []interface{}
+	db       *sql.DB
+	dialect  dialect.Dialect
+	refTable *schema.Schema
+	sql      strings.Builder
+	sqlVars  []interface{}
 }
 
 func (s *Session) DB() *sql.DB {
