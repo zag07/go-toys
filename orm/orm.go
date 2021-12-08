@@ -2,6 +2,7 @@ package orm
 
 import (
 	"database/sql"
+	"fmt"
 	"go-toys/orm/dialect"
 	"go-toys/orm/log"
 	"go-toys/orm/session"
@@ -41,4 +42,29 @@ func (e *Engine) Close() {
 
 func (e *Engine) NewSession() *session.Session {
 	return session.New(e.db, e.dialect)
+}
+
+type TxFunc func(*session.Session) (interface{}, error)
+
+func (e *Engine) Transaction(f TxFunc) (result interface{}, err error) {
+	s := e.NewSession()
+	if err = s.Begin(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			switch p := p.(type) {
+			case error:
+				err = p
+			default:
+				err = fmt.Errorf("%s", p)
+			}
+		}
+		if err != nil {
+			s.Rollback()
+		} else {
+			err = s.Commit()
+		}
+	}()
+	return f(s)
 }
