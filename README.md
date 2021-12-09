@@ -11,8 +11,14 @@ distributed cache
 
 this is from [7days-golang](https://github.com/geektutu/7days-golang)
 
-[ORM](https://geektutu.com/post/geeorm.html) 是一个模仿 [gorm](https://github.com/jinzhu/gorm)
-和 [xorm](https://github.com/go-xorm/xorm) 的 ORM 框架
+[ORM](https://geektutu.com/post/geeorm.html) is a [gorm](https://github.com/jinzhu/gorm)-like
+and [xorm](https://github.com/go-xorm/xorm)-like object relational mapping library
+
+## redis
+
+this is from [godis](https://github.com/HDT3213/godis)
+
+Godis is a golang implementation of Redis Server.
 
 ## rpc
 
